@@ -14,6 +14,7 @@ package reedsolomon
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"runtime"
 	"sync"
@@ -59,7 +60,8 @@ type Encoder interface {
 	// The reconstructed shard set is complete, but integrity is not verified.
 	// Use the Verify function to check if data set is ok.
 	Reconstruct(shards [][]byte) error
-
+	ReconstructWithList(shards [][]byte, failList *map[int]bool, dist *[]int, dataOnly bool) error
+	ReconstructWithKBlocks(shards [][]byte, failList *map[int]bool, chosenDisks *[]int, dist *[]int, dataOnly bool) error
 	// ReconstructData will recreate any missing data shards, if possible.
 	//
 	// Given a list of shards, some of which contain data, fills in the
@@ -76,24 +78,6 @@ type Encoder interface {
 	// As the reconstructed shard set may contain missing parity shards,
 	// calling the Verify function is likely to fail.
 	ReconstructData(shards [][]byte) error
-
-	// ReconstructSome will recreate only requested data shards, if possible.
-	//
-	// Given a list of shards, some of which contain data, fills in the
-	// data shards indicated by true values in the "required" parameter.
-	// The length of "required" array must be equal to DataShards.
-	//
-	// The length of "shards" array must be equal to Shards.
-	// You indicate that a shard is missing by setting it to nil or zero-length.
-	// If a shard is zero-length but has sufficient capacity, that memory will
-	// be used, otherwise a new []byte will be allocated.
-	//
-	// If there are too few shards to reconstruct the missing
-	// ones, ErrTooFewShards will be returned.
-	//
-	// As the reconstructed shard set may contain missing parity shards,
-	// calling the Verify function is likely to fail.
-	ReconstructSome(shards [][]byte, required []bool) error
 
 	// Update parity is use for change a few data shards and update it's parity.
 	// Input 'newDatashards' containing data shards changed.
@@ -124,6 +108,10 @@ type Encoder interface {
 	// If there are to few shards given, ErrTooFewShards will be returned.
 	// If the total data size is less than outSize, ErrShortData will be returned.
 	Join(dst io.Writer, shards [][]byte, outSize int) error
+
+	GetDecodeMatrix(invalidIndices []int) (matrix, error)
+	RecoverWithSomeShards(decodeMatrix matrix, inputs [][]byte, inputsIdx []int, invalidIndice int, tempShard []byte) (output []byte, err error)
+	MultiRecoverWithSomeShards(decodeMatrix matrix, inputs [][]byte, inputsIdx []int, invalidIndices []int, tempShards [][]byte) (output [][]byte, err error)
 }
 
 const (
@@ -297,22 +285,6 @@ func New(dataShards, parityShards int, opts ...Option) (Encoder, error) {
 
 	var err error
 	switch {
-	case r.o.customMatrix != nil:
-		if len(r.o.customMatrix) < parityShards {
-			return nil, errors.New("coding matrix must contain at least parityShards rows")
-		}
-		r.m = make([][]byte, r.Shards)
-		for i := 0; i < dataShards; i++ {
-			r.m[i] = make([]byte, dataShards)
-			r.m[i][i] = 1
-		}
-		for k, row := range r.o.customMatrix {
-			if len(row) < dataShards {
-				return nil, errors.New("coding matrix must contain at least dataShards columns")
-			}
-			r.m[dataShards+k] = make([]byte, dataShards)
-			copy(r.m[dataShards+k], row)
-		}
 	case r.o.fastOneParity && parityShards == 1:
 		r.m, err = buildXorMatrix(dataShards, r.Shards)
 	case r.o.useCauchy:
@@ -656,6 +628,7 @@ func (r *reedSolomon) codeSomeShards(matrixRows, inputs, outputs [][]byte, byteC
 		r.mPool.Put(m)
 		end = len(inputs[0])
 	} else if len(inputs)+len(outputs) > avx2CodeGenMinShards && r.canAVX2C(byteCount, maxAvx2Inputs, maxAvx2Outputs) {
+		//the
 		end = len(inputs[0])
 		inIdx := 0
 		m := r.mPool.Get().([]byte)
@@ -1013,7 +986,7 @@ func shardSize(shards [][]byte) int {
 // The reconstructed shard set is complete, but integrity is not verified.
 // Use the Verify function to check if data set is ok.
 func (r *reedSolomon) Reconstruct(shards [][]byte) error {
-	return r.reconstruct(shards, false, nil)
+	return r.reconstruct(shards, false)
 }
 
 // ReconstructData will recreate any missing data shards, if possible.
@@ -1032,39 +1005,318 @@ func (r *reedSolomon) Reconstruct(shards [][]byte) error {
 // As the reconstructed shard set may contain missing parity shards,
 // calling the Verify function is likely to fail.
 func (r *reedSolomon) ReconstructData(shards [][]byte) error {
-	return r.reconstruct(shards, true, nil)
+	return r.reconstruct(shards, true)
 }
 
-// ReconstructSome will recreate only requested data shards, if possible.
+// ReconstructWithList behaves like ReconstructData but takes failList
+// and stripe dist as input
+func (r *reedSolomon) ReconstructWithList(shards [][]byte, failList *map[int]bool, dist *[]int, dataOnly bool) error {
+
+	// Check arguments.
+	err := checkShards(shards, true)
+	if err != nil {
+		return err
+	}
+
+	shardSize := shardSize(shards)
+
+	// Quick check: are all of the shards present?  If so, there's
+	// nothing to do.
+	numberPresent := 0
+	dataPresent := 0
+	failMap := make(map[int]bool)
+	//we seek if dist contains the block in the failed disk
+	for i, blk := range *dist {
+		if _, ok := (*failList)[blk]; !ok {
+			numberPresent++
+			if blk < r.DataShards {
+				dataPresent++
+			}
+		} else {
+			failMap[i] = true
+		}
+	}
+	if numberPresent == r.Shards || dataOnly && dataPresent == r.DataShards {
+		// Cool.  All of the shards data data.  We don't
+		// need to do anything.
+		return nil
+	}
+
+	// More complete sanity check
+	if numberPresent < r.DataShards {
+		return ErrTooFewShards
+	}
+
+	// Pull out an array holding just the shards that
+	// correspond to the rows of the submatrix.  These shards
+	// will be the input to the decoding process that re-creates
+	// the missing data shards.
+	//
+	// Also, create an array of indices of the valid rows we do have
+	// and the invalid rows we don't have up until we have enough valid rows.
+	subShards := make([][]byte, r.DataShards)
+	validIndices := make([]int, r.DataShards)
+	invalidIndices := make([]int, 0)
+	subMatrixRow := 0
+	for matrixRow := 0; matrixRow < r.Shards && subMatrixRow < r.DataShards; matrixRow++ {
+		if _, ok := failMap[matrixRow]; !ok {
+			subShards[subMatrixRow] = shards[matrixRow]
+			validIndices[subMatrixRow] = matrixRow
+			subMatrixRow++
+		} else {
+			invalidIndices = append(invalidIndices, matrixRow)
+		}
+	}
+	// Attempt to get the cached inverted matrix out of the tree
+	// based on the indices of the invalid rows.
+	dataDecodeMatrix := r.tree.GetInvertedMatrix(invalidIndices)
+
+	// If the inverted matrix isn't cached in the tree yet we must
+	// construct it ourselves and insert it into the tree for the
+	// future.  In this way the inversion tree is lazily loaded.
+	if dataDecodeMatrix == nil {
+		// Pull out the rows of the matrix that correspond to the
+		// shards that we have and build a square matrix.  This
+		// matrix could be used to generate the shards that we have
+		// from the original data.
+		subMatrix, _ := newMatrix(r.DataShards, r.DataShards)
+		for subMatrixRow, validIndex := range validIndices {
+			for c := 0; c < r.DataShards; c++ {
+				subMatrix[subMatrixRow][c] = r.m[validIndex][c]
+			}
+		}
+		// Invert the matrix, so we can go from the encoded shards
+		// back to the original data.  Then pull out the row that
+		// generates the shard that we want to decode.  Note that
+		// since this matrix maps back to the original data, it can
+		// be used to create a data shard, but not a parity shard.
+		dataDecodeMatrix, err = subMatrix.Invert()
+		if err != nil {
+			return err
+		}
+
+		// Cache the inverted matrix in the tree for future use keyed on the
+		// indices of the invalid rows.
+		err = r.tree.InsertInvertedMatrix(invalidIndices, dataDecodeMatrix, r.Shards)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Re-create any data shards that were missing.
+	//
+	// The input to the coding is all of the shards we actually
+	// have, and the output is the missing data shards.  The computation
+	// is done using the special decode matrix we just built.
+	outputs := make([][]byte, r.ParityShards)
+	matrixRows := make([][]byte, r.ParityShards)
+	outputCount := 0
+
+	for iShard := 0; iShard < r.DataShards; iShard++ {
+		if _, ok := failMap[iShard]; ok {
+			if cap(shards[iShard]) >= shardSize {
+				shards[iShard] = shards[iShard][0:shardSize]
+			} else {
+				shards[iShard] = make([]byte, shardSize)
+			}
+			outputs[outputCount] = shards[iShard]
+			matrixRows[outputCount] = dataDecodeMatrix[iShard]
+			outputCount++
+		}
+	}
+	r.codeSomeShards(matrixRows, subShards, outputs[:outputCount], shardSize)
+
+	if dataOnly {
+		// Exit out early if we are only interested in the data shards
+		return nil
+	}
+
+	// Now that we have all of the data shards intact, we can
+	// compute any of the parity that is missing.
+	//
+	// The input to the coding is ALL of the data shards, including
+	// any that we just calculated.  The output is whichever of the
+	// data shards were missing.
+	outputCount = 0
+	for iShard := r.DataShards; iShard < r.Shards; iShard++ {
+		if _, ok := failMap[iShard]; ok {
+			if cap(shards[iShard]) >= shardSize {
+				shards[iShard] = shards[iShard][0:shardSize]
+			} else {
+				shards[iShard] = make([]byte, shardSize)
+			}
+			outputs[outputCount] = shards[iShard]
+			matrixRows[outputCount] = r.parity[iShard-r.DataShards]
+			outputCount++
+		}
+	}
+	r.codeSomeShards(matrixRows, shards[:r.DataShards], outputs[:outputCount], shardSize)
+	return nil
+}
+
+//ReconstructWithKBlocks recovers the failed blocks with only K surviving blocks.
 //
-// Given a list of shards, some of which contain data, fills in the
-// data shards indicated by true values in the "required" parameter.
-// The length of "required" array must be equal to DataShards.
-//
-// The length of "shards" array must be equal to Shards.
-// You indicate that a shard is missing by setting it to nil or zero-length.
-// If a shard is zero-length but has sufficient capacity, that memory will
-// be used, otherwise a new []byte will be allocated.
-//
-// If there are too few shards to reconstruct the missing
-// ones, ErrTooFewShards will be returned.
-//
-// As the reconstructed shard set may contain missing parity shards,
-// calling the Verify function is likely to fail.
-func (r *reedSolomon) ReconstructSome(shards [][]byte, required []bool) error {
-	return r.reconstruct(shards, true, required)
+//That is we use k blocks of `validIndices` to repair blocks of `invalidIndices``
+func (r *reedSolomon) ReconstructWithKBlocks(shards [][]byte, failList *map[int]bool, chosenDisks *[]int, dist *[]int, dataOnly bool) error {
+
+	// Check arguments.
+	err := checkShards(shards, true)
+	if err != nil {
+		return err
+	}
+
+	shardSize := shardSize(shards)
+
+	// Quick check: are all of the shards present?  If so, there's
+	// nothing to do.
+	numberPresent := 0
+	dataPresent := 0
+	failMap := make(map[int]bool)
+	//we seek if dist contains the block in the failed disk
+	for i, blk := range *dist {
+		if _, ok := (*failList)[blk]; !ok {
+			numberPresent++
+			if blk < r.DataShards {
+				dataPresent++
+			}
+		} else {
+			failMap[i] = true
+		}
+	}
+	if numberPresent == r.Shards || dataOnly && dataPresent == r.DataShards {
+		// Cool.  All of the shards data data.  We don't
+		// need to do anything.
+		return nil
+	}
+
+	// More complete sanity check
+	if numberPresent < r.DataShards {
+		return ErrTooFewShards
+	}
+
+	// Pull out an array holding just the shards that
+	// correspond to the rows of the submatrix.  These shards
+	// will be the input to the decoding process that re-creates
+	// the missing data shards.
+	//
+	// Also, create an array of indices of the valid rows we do have
+	// and the invalid rows we don't have up until we have enough valid rows.
+	subShards := make([][]byte, r.DataShards)
+	validIndices := make([]int, r.DataShards)
+	invalidIndices := make([]int, 0)
+	//pick the valid blocks from chosenDisks
+	mapNode := make(map[int]int)
+	for i, disk := range *dist {
+		mapNode[disk] = i
+	}
+	for i, disk := range *chosenDisks {
+		subShards[i] = shards[mapNode[disk]]
+		validIndices[i] = mapNode[disk]
+	}
+	// fmt.Printf("%v\n", validIndices)
+	for matrixRow := 0; matrixRow < r.Shards; matrixRow++ {
+		if _, ok := failMap[matrixRow]; ok {
+			invalidIndices = append(invalidIndices, matrixRow)
+		}
+	}
+	// Attempt to get the cached inverted matrix out of the tree
+	// based on the indices of the invalid rows.
+	// dataDecodeMatrix := r.tree.GetInvertedMatrix(invalidIndices)
+
+	// If the inverted matrix isn't cached in the tree yet we must
+	// construct it ourselves and insert it into the tree for the
+	// future.  In this way the inversion tree is lazily loaded.
+	// if dataDecodeMatrix == nil {
+	// Pull out the rows of the matrix that correspond to the
+	// shards that we have and build a square matrix.  This
+	// matrix could be used to generate the shards that we have
+	// from the original data.
+	subMatrix, _ := newMatrix(r.DataShards, r.DataShards)
+	for subMatrixRow, validIndex := range validIndices {
+		for c := 0; c < r.DataShards; c++ {
+			subMatrix[subMatrixRow][c] = r.m[validIndex][c]
+		}
+	}
+	// Invert the matrix, so we can go from the encoded shards
+	// back to the original data.  Then pull out the row that
+	// generates the shard that we want to decode.  Note that
+	// since this matrix maps back to the original data, it can
+	// be used to create a data shard, but not a parity shard.
+	dataDecodeMatrix, err := subMatrix.Invert()
+	if err != nil {
+		return err
+	}
+
+	// Cache the inverted matrix in the tree for future use keyed on the
+	// indices of the invalid rows.
+	err = r.tree.InsertInvertedMatrix(invalidIndices, dataDecodeMatrix, r.Shards)
+	if err != nil {
+		return err
+	}
+	// }
+
+	// Re-create any data shards that were missing.
+	//
+	// The input to the coding is all of the shards we actually
+	// have, and the output is the missing data shards.  The computation
+	// is done using the special decode matrix we just built.
+	outputs := make([][]byte, r.ParityShards)
+	matrixRows := make([][]byte, r.ParityShards)
+	outputCount := 0
+
+	for iShard := 0; iShard < r.DataShards; iShard++ {
+		if _, ok := failMap[iShard]; ok {
+			if cap(shards[iShard]) >= shardSize {
+				shards[iShard] = shards[iShard][0:shardSize]
+			} else {
+				shards[iShard] = make([]byte, shardSize)
+			}
+			outputs[outputCount] = shards[iShard]
+			matrixRows[outputCount] = dataDecodeMatrix[iShard]
+			outputCount++
+		}
+	}
+	r.codeSomeShards(matrixRows, subShards, outputs[:outputCount], shardSize)
+
+	if dataOnly {
+		// Exit out early if we are only interested in the data shards
+		return nil
+	}
+
+	// Now that we have all of the data shards intact, we can
+	// compute any of the parity that is missing.
+	//
+	// The input to the coding is ALL of the data shards, including
+	// any that we just calculated.  The output is whichever of the
+	// data shards were missing.
+	outputCount = 0
+	for iShard := r.DataShards; iShard < r.Shards; iShard++ {
+		if _, ok := failMap[iShard]; ok {
+			if cap(shards[iShard]) >= shardSize {
+				shards[iShard] = shards[iShard][0:shardSize]
+			} else {
+				shards[iShard] = make([]byte, shardSize)
+			}
+			outputs[outputCount] = shards[iShard]
+			matrixRows[outputCount] = r.parity[iShard-r.DataShards]
+			outputCount++
+		}
+	}
+	r.codeSomeShards(matrixRows, shards[:r.DataShards], outputs[:outputCount], shardSize)
+
+	return nil
 }
 
 // reconstruct will recreate the missing data shards, and unless
 // dataOnly is true, also the missing parity shards
 //
-// The length of "shards" array must be equal to Shards.
+// The length of the array must be equal to Shards.
 // You indicate that a shard is missing by setting it to nil.
 //
 // If there are too few shards to reconstruct the missing
 // ones, ErrTooFewShards will be returned.
-func (r *reedSolomon) reconstruct(shards [][]byte, dataOnly bool, required []bool) error {
-	if len(shards) != r.Shards || required != nil && len(required) < r.DataShards {
+func (r *reedSolomon) reconstruct(shards [][]byte, dataOnly bool) error {
+	if len(shards) != r.Shards {
 		return ErrTooFewShards
 	}
 	// Check arguments.
@@ -1079,19 +1331,15 @@ func (r *reedSolomon) reconstruct(shards [][]byte, dataOnly bool, required []boo
 	// nothing to do.
 	numberPresent := 0
 	dataPresent := 0
-	missingRequired := 0
 	for i := 0; i < r.Shards; i++ {
 		if len(shards[i]) != 0 {
 			numberPresent++
 			if i < r.DataShards {
 				dataPresent++
 			}
-		} else if required != nil && required[i] {
-			missingRequired++
 		}
 	}
-	if numberPresent == r.Shards || dataOnly && dataPresent == r.DataShards ||
-		required != nil && missingRequired == 0 {
+	if numberPresent == r.Shards || dataOnly && dataPresent == r.DataShards {
 		// Cool.  All of the shards data data.  We don't
 		// need to do anything.
 		return nil
@@ -1169,7 +1417,7 @@ func (r *reedSolomon) reconstruct(shards [][]byte, dataOnly bool, required []boo
 	outputCount := 0
 
 	for iShard := 0; iShard < r.DataShards; iShard++ {
-		if len(shards[iShard]) == 0 && (required == nil || required[iShard]) {
+		if len(shards[iShard]) == 0 {
 			if cap(shards[iShard]) >= shardSize {
 				shards[iShard] = shards[iShard][0:shardSize]
 			} else {
@@ -1195,7 +1443,7 @@ func (r *reedSolomon) reconstruct(shards [][]byte, dataOnly bool, required []boo
 	// data shards were missing.
 	outputCount = 0
 	for iShard := r.DataShards; iShard < r.Shards; iShard++ {
-		if len(shards[iShard]) == 0 && (required == nil || required[iShard]) {
+		if len(shards[iShard]) == 0 {
 			if cap(shards[iShard]) >= shardSize {
 				shards[iShard] = shards[iShard][0:shardSize]
 			} else {
@@ -1207,6 +1455,7 @@ func (r *reedSolomon) reconstruct(shards [][]byte, dataOnly bool, required []boo
 		}
 	}
 	r.codeSomeShards(matrixRows, shards[:r.DataShards], outputs[:outputCount], shardSize)
+
 	return nil
 }
 
@@ -1318,4 +1567,200 @@ func (r *reedSolomon) Join(dst io.Writer, shards [][]byte, outSize int) error {
 		write -= n
 	}
 	return nil
+}
+
+func (r *reedSolomon) GetDecodeMatrix(invalidIndices []int) (dataDecodeMatrix matrix, err error) {
+	for _, indice := range invalidIndices {
+		if indice < 0 || indice >= r.Shards {
+			return nil, ErrInvalidInput
+		}
+	}
+	validIndices := make([]int, r.DataShards)
+	validIndiceidx := 0
+	contain := false
+	for i := 0; i < r.Shards && validIndiceidx < r.DataShards; i++ {
+		for _, indice := range invalidIndices {
+			if indice == i {
+				contain = true
+				break
+			}
+		}
+		if contain {
+			contain = false
+			continue
+		}
+		validIndices[validIndiceidx] = i
+		validIndiceidx++
+	}
+
+	// dataDecodeMatrix := make([][]byte, r.DataShards)
+	// for i := range dataDecodeMatrix {
+	// 	dataDecodeMatrix[i] = make([]byte, r.DataShards)
+	// }
+	// Attempt to get the cached inverted matrix out of the tree
+	// based on the indices of the invalid rows.
+	dataDecodeMatrix = r.tree.GetInvertedMatrix(invalidIndices)
+
+	// If the inverted matrix isn't cached in the tree yet we must
+	// construct it ourselves and insert it into the tree for the
+	// future.  In this way the inversion tree is lazily loaded.
+	if dataDecodeMatrix == nil {
+		// Pull out the rows of the matrix that correspond to the
+		// shards that we have and build a square matrix.  This
+		// matrix could be used to generate the shards that we have
+		// from the original data.
+		subMatrix, _ := newMatrix(r.DataShards, r.DataShards)
+		for subMatrixRow, validIndex := range validIndices {
+			for c := 0; c < r.DataShards; c++ {
+				subMatrix[subMatrixRow][c] = r.m[validIndex][c]
+			}
+		}
+		// Invert the matrix, so we can go from the encoded shards
+		// back to the original data.  Then pull out the row that
+		// generates the shard that we want to decode.  Note that
+		// since this matrix maps back to the original data, it can
+		// be used to create a data shard, but not a parity shard.
+		dataDecodeMatrix, err = subMatrix.Invert()
+		if err != nil {
+			return nil, err
+		}
+		// Cache the inverted matrix in the tree for future use keyed on the
+		// indices of the invalid rows.
+		err = r.tree.InsertInvertedMatrix(invalidIndices, dataDecodeMatrix, r.Shards)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return dataDecodeMatrix, nil
+}
+
+func (r *reedSolomon) RecoverWithSomeShards(decodeMatrix matrix, inputs [][]byte, inputsIdx []int, invalidIndice int, tempShard []byte) (output []byte, err error) {
+	if len(inputs) == 0 {
+		return tempShard, nil
+	}
+	err = checkShards(inputs, false)
+	if err != nil {
+		return nil, err
+	}
+	if len(tempShard) != len(inputs[0]) {
+		return nil, ErrInvalidInput
+	}
+
+	matrixRow := make([]byte, len(decodeMatrix[0]))
+	if invalidIndice == -1 {
+		return nil, ErrInvalidInput
+	} else if invalidIndice >= 0 && invalidIndice < r.DataShards {
+		matrixRow = decodeMatrix[invalidIndice]
+	} else {
+		matrixRow = r.parity[invalidIndice-r.DataShards]
+	}
+
+	// compute the inputShards
+	output = make([]byte, len(inputs[0]))
+	start, end := 0, r.o.perRound
+	if end > len(inputs[0]) {
+		end = len(inputs[0])
+	}
+	for start < len(inputs[0]) {
+		for c := 0; c < len(inputs); c++ {
+			in := inputs[c][start:end]
+			galMulSliceXor(matrixRow[inputsIdx[c]], in, output[start:end], &r.o)
+		}
+		start = end
+		end += r.o.perRound
+		if end > len(inputs[0]) {
+			end = len(inputs[0])
+		}
+	}
+
+	// do not forget the tempShard
+	start, end = 0, r.o.perRound
+	if end > len(tempShard) {
+		end = len(tempShard)
+	}
+	for start < len(tempShard) {
+		galMulSliceXor(1, tempShard[start:end], output[start:end], &r.o)
+		start = end
+		end += r.o.perRound
+		if end > len(tempShard) {
+			end = len(tempShard)
+		}
+	}
+
+	return output, nil
+}
+
+func (r *reedSolomon) MultiRecoverWithSomeShards(decodeMatrix matrix, inputs [][]byte, inputsIdx []int, invalidIndices []int, tempShards [][]byte) (output [][]byte, err error) {
+	if len(inputs) == 0 {
+		return tempShards, nil
+	}
+	err = checkShards(inputs, false)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < len(tempShards); i++ {
+		if len(tempShards[i]) != len(inputs[0]) {
+			return nil, ErrInvalidInput
+		}
+	}
+
+	matrixRows := make([][]byte, len(invalidIndices))
+	for i := 0; i < len(invalidIndices); i++ {
+		matrixRows[i] = make([]byte, len(decodeMatrix[0]))
+	}
+	for i := 0; i < len(invalidIndices); i++ {
+		invalidIndice := invalidIndices[i]
+		if invalidIndice == -1 {
+			return nil, ErrInvalidInput
+		} else if invalidIndice >= 0 && invalidIndice < r.DataShards {
+			matrixRows[i] = decodeMatrix[invalidIndice]
+		} else {
+			matrixRows[i] = r.parity[invalidIndice-r.DataShards]
+		}
+	}
+
+	// compute the inputShards
+	output = make([][]byte, len(invalidIndices))
+	for i := 0; i < len(invalidIndices); i++ {
+		output[i] = make([]byte, len(inputs[0]))
+	}
+	for i := 0; i < len(invalidIndices); i++ {
+		start, end := 0, r.o.perRound
+		if end > len(inputs[0]) {
+			end = len(inputs[0])
+		}
+		for start < len(inputs[0]) {
+			for c := 0; c < len(inputs); c++ {
+				in := inputs[c][start:end]
+				galMulSliceXor(matrixRows[i][inputsIdx[c]], in, output[i][start:end], &r.o)
+			}
+			start = end
+			end += r.o.perRound
+			if end > len(inputs[0]) {
+				end = len(inputs[0])
+			}
+		}
+	}
+
+	// do not forget the tempShard
+	if len(tempShards) > len(output) {
+		fmt.Println(len(tempShards))
+		fmt.Println(len(output))
+	}
+	for i := 0; i < len(tempShards); i++ {
+		start, end := 0, r.o.perRound
+		if end > len(tempShards[i]) {
+			end = len(tempShards[i])
+		}
+		for start < len(tempShards[i]) {
+			galMulSliceXor(1, tempShards[i][start:end], output[i][start:end], &r.o)
+			start = end
+			end += r.o.perRound
+			if end > len(tempShards[i]) {
+				end = len(tempShards[i])
+			}
+		}
+	}
+
+	return output, nil
 }
