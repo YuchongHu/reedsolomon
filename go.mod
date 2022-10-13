@@ -1,4 +1,4 @@
-module github.com/klauspost/reedsolomon
+module github.com/YuchongHu/reedsolomon
 
 go 1.15
 
