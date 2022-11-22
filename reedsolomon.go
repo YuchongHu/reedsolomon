@@ -8,7 +8,6 @@
 // Package reedsolomon enables Erasure Coding in Go
 //
 // For usage and examples, see https://github.com/klauspost/reedsolomon
-//
 package reedsolomon
 
 import (
@@ -1154,9 +1153,9 @@ func (r *reedSolomon) ReconstructWithList(shards [][]byte, failList *map[int]boo
 	return nil
 }
 
-//ReconstructWithKBlocks recovers the failed blocks with only K surviving blocks.
+// ReconstructWithKBlocks recovers the failed blocks with only K surviving blocks.
 //
-//That is we use k blocks of `validIndices` to repair blocks of `invalidIndices``
+// That is we use k blocks of `validIndices` to repair blocks of `invalidIndices“
 func (r *reedSolomon) ReconstructWithKBlocks(shards [][]byte, failList *map[int]bool, chosenDisks *[]int, dist *[]int, dataOnly bool) error {
 
 	// Check arguments.
@@ -1631,6 +1630,37 @@ func (r *reedSolomon) GetDecodeMatrix(invalidIndices []int) (dataDecodeMatrix ma
 			return nil, err
 		}
 	}
+	// get decodeMatrixRows for parity
+	if len(invalidIndices) >= 2 {
+		hashMap := make(map[int]bool)
+		for i := 0; i < len(invalidIndices); i++ {
+			hashMap[invalidIndices[i]] = true
+		}
+		for i := 0; i < len(invalidIndices); i++ {
+			if invalidIndices[i] >= r.DataShards {
+				pi := invalidIndices[i] - r.DataShards
+				dataDecodeMatrix = append(dataDecodeMatrix, make([]byte, r.DataShards))
+				cnt := 0
+				for j := 0; j < r.DataShards; j++ {
+					if _, ok := hashMap[j]; !ok {
+						dataDecodeMatrix[len(dataDecodeMatrix)-1][cnt] = r.parity[pi][j]
+						cnt++
+					}
+				}
+				for j := 0; j < len(invalidIndices); j++ {
+					di := invalidIndices[j]
+					if di >= r.DataShards {
+						break
+					}
+					tmp := r.parity[pi][di]
+					tmpRow := make([]byte, r.DataShards)
+					galMulSliceXor(tmp, dataDecodeMatrix[di], tmpRow, &r.o)
+					galMulSliceXor(1, tmpRow, dataDecodeMatrix[len(dataDecodeMatrix)-1], &r.o)
+				}
+			}
+		}
+	}
+
 	return dataDecodeMatrix, nil
 }
 
@@ -1703,19 +1733,29 @@ func (r *reedSolomon) MultiRecoverWithSomeShards(decodeMatrix matrix, inputs [][
 			return nil, ErrInvalidInput
 		}
 	}
+	dataErasure := false
+	for i := 0; i < len(invalidIndices); i++ {
+		if invalidIndices[i] >= 0 && invalidIndices[i] < r.DataShards {
+			dataErasure = true
+		}
+	}
 
 	matrixRows := make([][]byte, len(invalidIndices))
 	for i := 0; i < len(invalidIndices); i++ {
 		matrixRows[i] = make([]byte, len(decodeMatrix[0]))
 	}
+	parityStart := 0
 	for i := 0; i < len(invalidIndices); i++ {
 		invalidIndice := invalidIndices[i]
 		if invalidIndice == -1 {
 			return nil, ErrInvalidInput
 		} else if invalidIndice >= 0 && invalidIndice < r.DataShards {
 			matrixRows[i] = decodeMatrix[invalidIndice]
-		} else {
+		} else if invalidIndice >= r.DataShards && !dataErasure {
 			matrixRows[i] = r.parity[invalidIndice-r.DataShards]
+		} else {
+			matrixRows[i] = decodeMatrix[r.DataShards+parityStart]
+			parityStart++
 		}
 	}
 
